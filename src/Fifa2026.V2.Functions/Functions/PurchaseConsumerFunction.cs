@@ -20,11 +20,16 @@ namespace Fifa2026.V2.Functions.Functions;
 public sealed class PurchaseConsumerFunction
 {
     private readonly IPurchaseRepository _repository;
+    private readonly IN8nWebhookNotifier _n8nNotifier;
     private readonly ILogger<PurchaseConsumerFunction> _logger;
 
-    public PurchaseConsumerFunction(IPurchaseRepository repository, ILogger<PurchaseConsumerFunction> logger)
+    public PurchaseConsumerFunction(
+        IPurchaseRepository repository,
+        IN8nWebhookNotifier n8nNotifier,
+        ILogger<PurchaseConsumerFunction> logger)
     {
         _repository = repository;
+        _n8nNotifier = n8nNotifier;
         _logger = logger;
     }
 
@@ -66,6 +71,35 @@ public sealed class PurchaseConsumerFunction
             {
                 case InsertOutcome.Inserted:
                     _logger.LogInformation("Compra v2 gravada com sucesso (correlationId={CorrelationId}).", message.CorrelationId);
+
+                    // Story 2.4 AC-6/AC-7 — APENAS em Inserted (não em Duplicate): dispara o
+                    // webhook do n8n para a orquestração pós-compra (e-mail mock, log, etc.).
+                    // Fire-and-forget: o notifier já encapsula timeout (5s) e try/catch e
+                    // NUNCA lança. O try/catch abaixo é defesa em profundidade — mesmo que o
+                    // notifier viole o contrato, a compra JÁ foi gravada e a mensagem do
+                    // Service Bus NUNCA pode ir ao DLQ por falha do n8n. O payload sai do
+                    // CORPO da mensagem (correlationId/entraOid), não das Application
+                    // Properties do Service Bus.
+                    try
+                    {
+                        await _n8nNotifier.NotifyPurchaseAsync(
+                            new N8nWebhookPayload
+                            {
+                                CorrelationId = message.CorrelationId,
+                                MatchId = message.MatchId,
+                                Category = message.Category,
+                                EntraOid = message.EntraOid
+                            },
+                            cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Falha inesperada no disparo do webhook n8n (correlationId={CorrelationId}). " +
+                            "A compra já foi gravada; a mensagem do Service Bus NÃO vai ao DLQ.",
+                            message.CorrelationId);
+                    }
                     break;
 
                 case InsertOutcome.Duplicate:
